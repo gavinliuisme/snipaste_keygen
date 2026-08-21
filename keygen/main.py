@@ -1,12 +1,21 @@
 import base64
 import json
 import zlib
+import shutil
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.exceptions import InvalidSignature
 import os
 from device_id import *
 import argparse
+
+# Snipaste.exe 补丁定义
+# 搜索模式: 0F B6 D8 4C 89 6C 24 48
+# 替换模式: B3 01 90 ?? ?? ?? ?? ??  (?? 表示保留原字节)
+PATCH_SEARCH = b'\x0F\xB6\xD8\x4C\x89\x6C\x24\x48'
+PATCH_REPLACE = b'\xB3\x01\x90'            # 仅前 3 字节替换
+PATCH_FILE_OFFSET = 0x0024AC80             # .text 节原始偏移
+PATCH_VA        = 0x0024B881               # 虚拟地址(参考)
 
 class Ed25519Helper:
     """Ed25519签名验证工具类，与CryptoPP兼容"""
@@ -399,13 +408,13 @@ def activation_machine(name:str, dom:str, machineid:str) -> str:
     code=f'{port0}{part1}-{b64_data.decode()}'
     return  code
 
-def activation_host_machine():
+def activation_host_machine(name:str='ikun'):
     dom=gen_dom()
     machine_guid=get_machine_guid()
     machineid=gen_expected_machineid(machine_guid,9)
 
 
-    activation_code = activation_machine('ikun', dom, machineid)
+    activation_code = activation_machine(name, dom, machineid)
     print('-'*50)
     print('The activation code for the host machine is:')
     print(activation_code)
@@ -477,18 +486,186 @@ def activation_client_machine(name:str, device_info:str):
 
     return
 
+def patch_snipaste(exe_path: str = 'Snipaste.exe') -> bool:
+    """对 Snipaste.exe 进行补丁。
+    搜索模式: 0F B6 D8 4C 89 6C 24 48
+    替换模式: B3 01 90 ?? ?? ?? ?? ??  (?? = 保留原字节)
+    补丁前若 Snipaste.exe.bak 不存在则先备份，存在则跳过备份。"""
+    if not os.path.isfile(exe_path):
+        print(f'[X] 找不到文件: {exe_path}')
+        return False
+
+    bak_path = exe_path + '.bak'
+    if os.path.isfile(bak_path):
+        print(f'[i] 备份文件已存在，跳过备份: {bak_path}')
+    else:
+        try:
+            shutil.copy2(exe_path, bak_path)
+            print(f'[OK] 已备份: {bak_path}')
+        except Exception as e:
+            print(f'[X] 备份失败: {e}')
+            return False
+
+    try:
+        with open(exe_path, 'rb') as f:
+            data = f.read()
+    except Exception as e:
+        print(f'[X] 读取文件失败: {e}')
+        return False
+
+    # 1) 先在预期原始偏移处检查是否已打过补丁(避免重复打)
+    if PATCH_FILE_OFFSET + 3 <= len(data) and \
+       data[PATCH_FILE_OFFSET:PATCH_FILE_OFFSET+3] == PATCH_REPLACE:
+        print(f'[i] 偏移 0x{PATCH_FILE_OFFSET:08X} 处已是补丁后字节，跳过')
+        return True
+
+    # 2) 搜索原始模式
+    idx = data.find(PATCH_SEARCH)
+    if idx < 0:
+        print('[X] 未找到补丁模式 0F B6 D8 4C 89 6C 24 48')
+        print('    (文件可能已被补丁过、版本不匹配或被加壳/混淆)')
+        return False
+
+    print(f'[i] 找到匹配位置: 文件偏移 0x{idx:08X} (预期 0x{PATCH_FILE_OFFSET:08X})')
+    if idx != PATCH_FILE_OFFSET:
+        print('    [!] 警告: 实际位置与预期原始偏移不一致，仍按匹配位置继续')
+
+    # 3) 执行替换: 前 3 字节改为 B3 01 90, 后 5 字节保留
+    patched = data[:idx] + PATCH_REPLACE + data[idx+3:]
+    try:
+        with open(exe_path, 'wb') as f:
+            f.write(patched)
+    except Exception as e:
+        print(f'[X] 写入失败: {e}')
+        return False
+
+    print(f'[OK] 补丁成功: {exe_path}  (偏移 0x{idx:08X}: 0F B6 D8 -> B3 01 90)')
+    return True
+
+
+def restore_snipaste(exe_path: str = 'Snipaste.exe') -> bool:
+    """从备份恢复 Snipaste.exe"""
+    if not os.path.isfile(exe_path):
+        print(f'[X] 找不到文件: {exe_path}')
+        return False
+    bak_path = exe_path + '.bak'
+    if not os.path.isfile(bak_path):
+        print(f'[X] 找不到备份文件: {bak_path}')
+        return False
+    try:
+        shutil.copy2(bak_path, exe_path)
+    except Exception as e:
+        print(f'[X] 恢复失败: {e}')
+        return False
+    print(f'[OK] 已从备份恢复: {exe_path}')
+    return True
+
+
+def _pause_exit():
+    try:
+        input('\nPress Enter to exit...')
+    except EOFError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description='This is a snipaste keygen')
     parser.add_argument('-d', '--device', default=None, help="The client device information")
     parser.add_argument('-n', '--name', default=None, help="The client device name")
+    parser.add_argument('-p', '--patch', action='store_true', help="Patch Snipaste.exe")
+    parser.add_argument('-r', '--restore', action='store_true', help="Restore Snipaste.exe from backup")
+    parser.add_argument('--exe', default='Snipaste.exe', help="Path to Snipaste.exe (default: Snipaste.exe)")
 
     args = parser.parse_args()
 
+    # 命令行模式: 单步操作后退出
+    if args.patch:
+        patch_snipaste(args.exe)
+        _pause_exit()
+        return 0
+    if args.restore:
+        restore_snipaste(args.exe)
+        _pause_exit()
+        return 0
     if args.device and args.name:
         activation_client_machine(args.name, args.device)
-    else:
-        activation_host_machine()
+        _pause_exit()
+        return 0
 
+    # 交互式菜单（循环）
+    default_exe = args.exe
+    while True:
+        print()
+        print('=' * 50)
+        print('  1. 先补丁，再生成激活码（默认选项）')
+        print('  2. 先补丁，再生成激活码')
+        print('  3. 为本机生成激活码')
+        print('  4. 补丁 Snipaste.exe')
+        print('  5. 从备份还原 Snipaste.exe')
+        print('  0. 退出')
+        print('=' * 50)
+        try:
+            choice = input('请选择 (直接回车=1): ').strip()
+        except EOFError:
+            choice = ''
+
+        # 直接回车默认执行选项 1
+        if choice == '':
+            choice = '1'
+
+        if choice == '1':
+            # 全部使用默认值，无任何提示
+            ok = patch_snipaste(default_exe)
+            if ok:
+                activation_host_machine('ikun')
+            else:
+                print('[i] 补丁失败，跳过生成激活码')
+
+        elif choice == '2':
+            try:
+                exe_path = input(f"Snipaste.exe 路径 (默认 {default_exe}): ").strip()
+            except EOFError:
+                exe_path = ''
+            exe_path = exe_path or default_exe
+            ok = patch_snipaste(exe_path)
+            if ok:
+                try:
+                    name = input("请输入 name (默认 ikun): ").strip()
+                except EOFError:
+                    name = ''
+                activation_host_machine(name or 'ikun')
+            else:
+                print('[i] 补丁失败，跳过生成激活码')
+
+        elif choice == '3':
+            try:
+                name = input("请输入 name (默认 ikun): ").strip()
+            except EOFError:
+                name = ''
+            activation_host_machine(name or 'ikun')
+
+        elif choice == '4':
+            try:
+                exe_path = input(f"Snipaste.exe 路径 (默认 {default_exe}): ").strip()
+            except EOFError:
+                exe_path = ''
+            patch_snipaste(exe_path or default_exe)
+
+        elif choice == '5':
+            try:
+                exe_path = input(f"Snipaste.exe 路径 (默认 {default_exe}): ").strip()
+            except EOFError:
+                exe_path = ''
+            restore_snipaste(exe_path or default_exe)
+
+        elif choice == '0':
+            print('再见')
+            break
+
+        else:
+            print('[X] 无效的选项，请重新输入')
+
+    _pause_exit()
     return 0
 
 if __name__ == "__main__":
